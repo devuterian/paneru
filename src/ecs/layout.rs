@@ -692,6 +692,38 @@ impl LayoutStrip {
         self.columns.swap(left, right);
     }
 
+    /// Moves the column at `from` so it ends up at index `to` of the strip,
+    /// shifting the columns in between by one. `to` is clamped to the end.
+    pub fn move_column(&mut self, from: usize, to: usize) {
+        if let Some(column) = self.columns.remove(from) {
+            let to = to.min(self.columns.len());
+            self.columns.insert(to, column);
+        }
+    }
+
+    /// Returns the column index a window dropped at strip-relative `x` lands
+    /// on: the number of columns whose center lies left of `x`, laid out as
+    /// they currently are. The column at `skip` (the one being dragged) is not
+    /// counted, so the result is an index into the strip *without* it — which
+    /// is what [`LayoutStrip::move_column`] and [`LayoutStrip::insert_at`]
+    /// expect.
+    pub fn drop_index<W>(&self, skip: Option<usize>, x: i32, get_window_frame: &W) -> usize
+    where
+        W: Fn(Entity) -> Option<IRect>,
+    {
+        let mut left_edge = 0;
+        let mut index = 0;
+        for (column_index, column) in self.columns.iter().enumerate() {
+            let width = column.width(get_window_frame).unwrap_or(0);
+            let center = left_edge + width / 2;
+            left_edge += width;
+            if Some(column_index) != skip && center < x {
+                index += 1;
+            }
+        }
+        index
+    }
+
     /// Returns the number of panels in the pane.
     ///
     /// # Returns
@@ -2087,6 +2119,52 @@ mod tests {
         strip.swap(0, 2);
         assert_eq!(strip.index_of(entities[2]).unwrap(), 0);
         assert_eq!(strip.index_of(entities[0]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_move_column() {
+        let (_world, mut strip, entities) = setup_world_and_strip();
+        strip.move_column(0, 2);
+        assert_eq!(
+            strip.all_columns(),
+            vec![entities[1], entities[2], entities[0]]
+        );
+        strip.move_column(2, 0);
+        assert_eq!(
+            strip.all_columns(),
+            vec![entities[0], entities[1], entities[2]]
+        );
+        // Out-of-range targets clamp to the end; out-of-range sources are a no-op.
+        strip.move_column(1, 10);
+        assert_eq!(
+            strip.all_columns(),
+            vec![entities[0], entities[2], entities[1]]
+        );
+        strip.move_column(10, 0);
+        assert_eq!(
+            strip.all_columns(),
+            vec![entities[0], entities[2], entities[1]]
+        );
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let (_world, strip, _entities) = setup_world_and_strip();
+        // Three 400px columns: centers at 200, 600 and 1000.
+        let frame = |_| Some(IRect::new(0, 0, 400, 800));
+
+        // Dragging the first column: it has to pass a neighbour's center.
+        assert_eq!(strip.drop_index(Some(0), 500, &frame), 0);
+        assert_eq!(strip.drop_index(Some(0), 700, &frame), 1);
+        assert_eq!(strip.drop_index(Some(0), 1100, &frame), 2);
+        // Dragging the last column back to the front.
+        assert_eq!(strip.drop_index(Some(2), -50, &frame), 0);
+        assert_eq!(strip.drop_index(Some(2), 300, &frame), 1);
+        assert_eq!(strip.drop_index(Some(2), 900, &frame), 2);
+        // A window coming from elsewhere counts every column.
+        assert_eq!(strip.drop_index(None, 0, &frame), 0);
+        assert_eq!(strip.drop_index(None, 650, &frame), 2);
+        assert_eq!(strip.drop_index(None, 5000, &frame), 3);
     }
 
     #[test]

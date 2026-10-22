@@ -1214,32 +1214,43 @@ fn to_next_display(
         commands.reshuffle_around(entity);
 
         // Add a delayed refresh of the window size - because the other display can have different bounds.
-        let display_entity = child.parent();
-        let moved_window = entity;
-        let refresh_size = move |windows: Query<&Bounds, With<Window>>,
-                                 displays: Query<(&Display, Option<&DockPosition>)>,
-                                 mut commands: Commands,
-                                 config: Res<Config>| {
-            let Ok((display, dock)) = displays.get(display_entity) else {
-                return;
-            };
-            let viewport_bounds = display.actual_display_bounds(dock, &config);
-            if let Ok(Bounds(bounds)) = windows.get(moved_window) {
-                debug!("Refreshing size of window {entity}");
-                // Preserve the window's width ratio relative to the target
-                // display's usable viewport (dock- and padding-adjusted), so a
-                // fixed dock is accounted for consistently with the source.
-                let width = width_ratio.map_or(bounds.x, |ratio| {
-                    round_px(ratio * f64::from(viewport_bounds.width()))
-                });
-                let size = Size::new(width, viewport_bounds.height());
-                commands.resize_entity(moved_window, size);
-                commands.reshuffle_around(moved_window);
-            }
-        };
-        let system_id = commands.register_system(refresh_size);
-        Timeout::callback(Duration::from_millis(150), system_id, &mut commands);
+        refresh_size_on_display(entity, child.parent(), width_ratio, &mut commands);
     }
+}
+
+/// Schedules a refresh of `moved_window`'s size shortly after it was moved
+/// onto `display_entity`, since the other display can have different bounds:
+/// the height fills the display's viewport, and the width keeps `width_ratio`
+/// of it when one is given.
+pub(crate) fn refresh_size_on_display(
+    moved_window: Entity,
+    display_entity: Entity,
+    width_ratio: Option<f64>,
+    commands: &mut Commands,
+) {
+    let refresh_size = move |windows: Query<&Bounds, With<Window>>,
+                             displays: Query<(&Display, Option<&DockPosition>)>,
+                             mut commands: Commands,
+                             config: Res<Config>| {
+        let Ok((display, dock)) = displays.get(display_entity) else {
+            return;
+        };
+        let viewport_bounds = display.actual_display_bounds(dock, &config);
+        if let Ok(Bounds(bounds)) = windows.get(moved_window) {
+            debug!("Refreshing size of window {moved_window}");
+            // Preserve the window's width ratio relative to the target
+            // display's usable viewport (dock- and padding-adjusted), so a
+            // fixed dock is accounted for consistently with the source.
+            let width = width_ratio.map_or(bounds.x, |ratio| {
+                round_px(ratio * f64::from(viewport_bounds.width()))
+            });
+            let size = Size::new(width, viewport_bounds.height());
+            commands.resize_entity(moved_window, size);
+            commands.reshuffle_around(moved_window);
+        }
+    };
+    let system_id = commands.register_system(refresh_size);
+    Timeout::callback(Duration::from_millis(150), system_id, commands);
 }
 
 /// Moves the mouse pointer to the next available display.

@@ -1,26 +1,31 @@
 use bevy::app::{App, Plugin, Update};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::With;
+use bevy::ecs::query::Without;
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
+use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use super::{MouseHeldMarker, Timeout};
+use crate::commands::refresh_size_on_display;
 use crate::config::Config;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, RepositionMarker,
-    Scrolling, SpawnCommandsExt, UpdateSet,
+    Scrolling, SelectedVirtualMarker, SpawnCommandsExt, UpdateSet,
 };
 use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
-use crate::manager::{Display, Origin, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
 use crate::platform::WinID;
 use crate::util::round_px;
 
@@ -29,6 +34,63 @@ use crate::util::round_px;
 /// macOS prevents windows from being moved further down than a fully visible title bar,
 /// so the parked sliver of a hidden virtual workspace lives within this region.
 const CORNER_DEAD_ZONE_PX: i32 = 30;
+
+/// How far, in pixels, both the cursor and the window have to travel between
+/// mouse-down and mouse-up for the release to count as dragging the window to
+/// a new place in the strip rather than a click.
+const DRAG_REORDER_THRESHOLD_PX: i32 = 24;
+
+/// A size change beyond this many pixels means the window was resized by an
+/// edge, not dragged by its title bar.
+const DRAG_RESIZE_TOLERANCE_PX: i32 = 2;
+
+/// How far the window's horizontal travel may differ from the cursor's for it
+/// to still count as carried along by the cursor. Anything else moved it —
+/// paneru scrolling the strip while the button was held down, say.
+const DRAG_FOLLOW_TOLERANCE_PX: i32 = 40;
+
+/// Drops a recorded drag start if the matching mouse-up never arrives.
+const DRAG_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Where a window was when the mouse button went down on it, so the release
+/// can tell a title-bar drag apart from a click or an edge resize.
+#[derive(Component)]
+pub(super) struct WindowDragStart {
+    entity: Entity,
+    point: Origin,
+    frame: IRect,
+    /// The window's frame read straight from the OS on mouse-up. Its move
+    /// notifications can trail the release, so the cached one may be stale.
+    released: Option<IRect>,
+}
+
+/// Strips as a window drop sees them: where they sit, which display owns
+/// them, and whether they are the one shown on that display.
+type DropStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static Position,
+        &'static ChildOf,
+        Option<&'static RepositionMarker>,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    ),
+>;
+
+/// Windows whose frame a mouse-up re-reads from the OS.
+type DraggedWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static mut Position,
+        Has<RepositionMarker>,
+    ),
+    Without<LayoutStrip>,
+>;
 
 pub struct MouseEventsPlugin;
 
@@ -49,6 +111,9 @@ impl Plugin for MouseEventsPlugin {
                     mouse_resize_trigger,
                     mouse_down_trigger,
                 )
+                    .run_if(mission_control_inactive),
+                (refresh_dragged_window_frame, mouse_drag_drop_trigger)
+                    .chain()
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
                 horizontal_warp_mouse_trigger,
@@ -225,6 +290,7 @@ fn mouse_moved_trigger(
 /// * `active_display` - A query for the active display.
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to trigger a reshuffle.
+#[allow(clippy::too_many_arguments)]
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
@@ -232,6 +298,7 @@ fn mouse_down_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
+    drag_starts: Query<Entity, With<WindowDragStart>>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -239,6 +306,13 @@ fn mouse_down_trigger(
             continue;
         };
         trace!("{point:?}");
+
+        // A new press supersedes any drag whose mouse-up was lost.
+        for stale in &drag_starts {
+            if let Ok(mut entity_commands) = commands.get_entity(stale) {
+                entity_commands.try_despawn();
+            }
+        }
 
         let Some((_, entity)) = window_manager
             .find_window_at_point(point)
@@ -262,6 +336,19 @@ fn mouse_down_trigger(
             if let Ok(mut entity_commands) = commands.get_entity(held) {
                 entity_commands.try_despawn();
             }
+        }
+
+        if let Some(frame) = windows.frame(entity) {
+            let timeout = Timeout::new(DRAG_START_TIMEOUT, None, &mut commands);
+            commands.spawn((
+                WindowDragStart {
+                    entity,
+                    point: origin_from(*point),
+                    frame,
+                    released: None,
+                },
+                timeout,
+            ));
         }
 
         if config.window_hidden_ratio() >= 1.0 {
@@ -291,6 +378,210 @@ fn mouse_up_trigger(
             commands.reshuffle_around(marker.0);
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
+            }
+        }
+    }
+}
+
+/// True when the window moved along with the cursor — both by at least
+/// [`DRAG_REORDER_THRESHOLD_PX`] — while keeping its size, i.e. it was dragged
+/// by its title bar rather than clicked or resized by an edge.
+fn is_window_drag(start: &WindowDragStart, cursor: Origin, frame: IRect) -> bool {
+    let travel = |from: Origin, to: Origin| (to.x - from.x).abs().max((to.y - from.y).abs());
+    let resized = (frame.width() - start.frame.width()).abs() > DRAG_RESIZE_TOLERANCE_PX
+        || (frame.height() - start.frame.height()).abs() > DRAG_RESIZE_TOLERANCE_PX;
+    // Only the horizontal travel has to match: macOS stops a window at the
+    // menu bar while the cursor carries on upwards.
+    let followed = ((frame.min.x - start.frame.min.x) - (cursor.x - start.point.x)).abs()
+        <= DRAG_FOLLOW_TOLERANCE_PX;
+    !resized
+        && followed
+        && travel(start.point, cursor) >= DRAG_REORDER_THRESHOLD_PX
+        && travel(start.frame.min, frame.min) >= DRAG_REORDER_THRESHOLD_PX
+}
+
+/// On mouse-up, reads the dragged window's frame from the OS rather than
+/// trusting the last move notification, and records where it was let go.
+fn refresh_dragged_window_frame(
+    mut messages: MessageReader<InputEvent>,
+    mut drag_starts: Populated<&mut WindowDragStart>,
+    mut windows: DraggedWindows,
+) {
+    if !messages
+        .read()
+        .any(|InputEvent(event)| matches!(event, Event::MouseUp { .. }))
+    {
+        return;
+    }
+    for mut drag in &mut drag_starts {
+        let Ok((mut window, mut position, repositioning)) = windows.get_mut(drag.entity) else {
+            continue;
+        };
+        // Our own move in flight: the frame is ours, not where it was dropped.
+        if repositioning {
+            continue;
+        }
+        let Ok(frame) = window.update_frame() else {
+            continue;
+        };
+        if position.0 != frame.min {
+            position.0 = frame.min;
+        }
+        drag.released = Some(frame);
+    }
+}
+
+/// Handles the release of a window dragged by its title bar. macOS has already
+/// moved the window along with the cursor; here it is slotted into the strip
+/// at the column under the cursor, the other columns shifting to make room. A
+/// release over another display moves the window into that display's strip
+/// instead. Floating windows, edge resizes and plain clicks are left alone.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn mouse_drag_drop_trigger(
+    mut messages: MessageReader<InputEvent>,
+    drag_starts: Populated<(Entity, &WindowDragStart)>,
+    windows: Windows,
+    mut strips: DropStrips,
+    displays: Query<(Entity, &Display, Option<&DockPosition>)>,
+    repositioning: Query<(), With<RepositionMarker>>,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for InputEvent(event) in messages.read() {
+        let Event::MouseUp { point, .. } = event else {
+            continue;
+        };
+        let cursor = origin_from(*point);
+
+        for (drag_entity, drag) in &drag_starts {
+            if let Ok(mut entity_commands) = commands.get_entity(drag_entity) {
+                entity_commands.try_despawn();
+            }
+
+            let entity = drag.entity;
+            // A window paneru itself is moving did not follow the cursor.
+            if repositioning.contains(entity) {
+                continue;
+            }
+            if windows
+                .get_managed(entity)
+                .is_none_or(|(_, _, unmanaged)| unmanaged.is_some())
+            {
+                continue;
+            }
+            let Some(frame) = drag.released.or_else(|| windows.frame(entity)) else {
+                continue;
+            };
+            if !is_window_drag(drag, cursor, frame) {
+                continue;
+            }
+            let Some((source_entity, source_display)) = strips
+                .iter()
+                .find(|(_, strip, ..)| strip.contains(entity))
+                .map(|(strip_entity, _, _, child, ..)| (strip_entity, child.parent()))
+            else {
+                continue;
+            };
+
+            let target_display = displays
+                .get(source_display)
+                .ok()
+                .filter(|(_, display, _)| display.bounds().contains(cursor))
+                .or_else(|| {
+                    displays
+                        .iter()
+                        .find(|(_, display, _)| display.bounds().contains(cursor))
+                });
+            let get_frame = |entity| windows.frame(entity);
+
+            match target_display {
+                Some((target_display, display, _)) if target_display != source_display => {
+                    let Ok(space_id) = window_manager.active_display_space(display.id()) else {
+                        continue;
+                    };
+                    let Some(target_entity) = strips.iter().find_map(
+                        |(strip_entity, strip, _, child, _, active, selected)| {
+                            (child.parent() == target_display
+                                && (active || selected)
+                                && strip.id() == space_id
+                                && !strip.is_fullscreen())
+                            .then_some(strip_entity)
+                        },
+                    ) else {
+                        continue;
+                    };
+
+                    // Keep the width relative to the usable viewport, like
+                    // moving the window there with the keyboard does.
+                    let width_ratio = displays
+                        .get(source_display)
+                        .ok()
+                        .map(|(_, display, dock)| {
+                            display.actual_display_bounds(dock, &config).width()
+                        })
+                        .filter(|width| *width > 0)
+                        .map(|width| f64::from(frame.width()) / f64::from(width));
+
+                    // macOS carries a native tab group as one window, so the
+                    // whole group moves.
+                    let mut group = vec![entity];
+                    if let Ok((_, mut source, ..)) = strips.get_mut(source_entity) {
+                        group = source.tab_group(entity).unwrap_or(group);
+                        let neighbour = source
+                            .left_neighbour(entity)
+                            .or_else(|| source.right_neighbour(entity))
+                            .filter(|neighbour| !group.contains(neighbour));
+                        for member in &group {
+                            source.remove(*member);
+                        }
+                        if let Some(neighbour) = neighbour {
+                            commands.reshuffle_around(neighbour);
+                        }
+                    }
+                    if let Ok((_, mut target, Position(origin), _, reposition, ..)) =
+                        strips.get_mut(target_entity)
+                    {
+                        let origin = reposition.map_or(*origin, |target| target.0);
+                        let index = target.drop_index(None, cursor.x - origin.x, &get_frame);
+                        debug!("dropping {entity} onto display {target_display} at column {index}");
+                        target.insert_tab_group_at(index, &group);
+                    }
+                    commands.reshuffle_around(entity);
+                    for member in group {
+                        refresh_size_on_display(member, target_display, width_ratio, &mut commands);
+                    }
+                }
+                _ => {
+                    let Ok((_, mut strip, Position(origin), _, reposition, ..)) =
+                        strips.get_mut(source_entity)
+                    else {
+                        continue;
+                    };
+                    // Columns are laid out against where the strip is
+                    // heading, not where it is mid-animation.
+                    let strip_origin = reposition.map_or(*origin, |target| target.0);
+                    if strip.is_fullscreen() {
+                        continue;
+                    }
+                    let Ok(from) = strip.index_of(entity) else {
+                        continue;
+                    };
+                    let to = strip.drop_index(Some(from), cursor.x - strip_origin.x, &get_frame);
+                    if to != from {
+                        debug!("dragged {entity} from column {from} to {to}");
+                        strip.move_column(from, to);
+                    }
+                    commands.ensure_visible(entity);
+                }
+            }
+
+            // macOS left the window wherever it was let go. Its slot may not
+            // have changed, so mark it as moved to have it laid out again.
+            if let Some(layout_position) = windows.layout_position(entity)
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_insert(layout_position.clone());
             }
         }
     }
@@ -528,6 +819,40 @@ mod tests {
             },
             20,
         )
+    }
+
+    #[test]
+    fn window_drag_needs_the_window_to_follow_the_cursor() {
+        let start = WindowDragStart {
+            entity: Entity::PLACEHOLDER,
+            point: Origin::new(100, 10),
+            frame: IRect::new(40, 0, 440, 700),
+            released: None,
+        };
+        let moved = |dx, dy| IRect::new(40 + dx, dy, 440 + dx, 700 + dy);
+
+        // Carried along: horizontally, and upwards past a menu bar stop.
+        assert!(is_window_drag(&start, Origin::new(400, 10), moved(300, 0)));
+        assert!(is_window_drag(
+            &start,
+            Origin::new(130, -600),
+            moved(30, -560)
+        ));
+        // A click, or a nudge under the threshold.
+        assert!(!is_window_drag(&start, Origin::new(100, 10), moved(0, 0)));
+        assert!(!is_window_drag(&start, Origin::new(110, 15), moved(10, 5)));
+        // Something else moved the window while the cursor went elsewhere.
+        assert!(!is_window_drag(
+            &start,
+            Origin::new(100, 300),
+            moved(300, 0)
+        ));
+        // Pulled by its left edge: origin and width change together.
+        assert!(!is_window_drag(
+            &start,
+            Origin::new(-200, 10),
+            IRect::new(-260, 0, 440, 700)
+        ));
     }
 
     #[test]
