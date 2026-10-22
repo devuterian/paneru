@@ -193,7 +193,7 @@ impl TryFrom<&Event> for LuaEvent {
                 fingers: *fingers,
             },
             Event::VerticalScrollTick { delta } => LuaEvent::VerticalScrollTick { delta: *delta },
-            Event::Scroll { delta } => LuaEvent::Scroll { delta: *delta },
+            Event::Scroll { delta, .. } => LuaEvent::Scroll { delta: *delta },
             Event::TouchpadDown => LuaEvent::TouchpadDown,
             Event::TouchpadUp => LuaEvent::TouchpadUp,
 

@@ -109,6 +109,7 @@ fn swipe_gesture(
     let mut touchpad_down = false;
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
+    let mut wheel_delta = 0.0;
 
     // Normalization: Touchpad deltas are typically small fractions.
     // Scroll wheel deltas can be larger. We scale it down slightly
@@ -125,7 +126,10 @@ fn swipe_gesture(
                 touchpad_down = true;
                 total_delta = 0.0;
             }
-            Event::Scroll { delta } => {
+            Event::Scroll { delta, wheel: true } => {
+                wheel_delta += *delta * scroll_scale;
+            }
+            Event::Scroll { delta, wheel: false } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
             }
@@ -143,7 +147,7 @@ fn swipe_gesture(
         }
     }
 
-    if !touchpad_down && !has_scroll_event {
+    if !touchpad_down && !has_scroll_event && wheel_delta == 0.0 {
         return;
     }
 
@@ -196,6 +200,25 @@ fn swipe_gesture(
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
                 is_user_swiping: true,
+                last_event: time.elapsed(),
+            });
+        }
+    }
+
+    if wheel_delta != 0.0 {
+        // Plain wheels get no momentum from macOS, so turn each tick into a
+        // velocity impulse and let `apply_inertia` glide it out. Scaling by
+        // the deceleration keeps the total travel per tick the same as before.
+        let impulse = wheel_delta * swipe_sensitivity * config.swipe_deceleration();
+        if let Some(scrolling) = scrolling.as_mut() {
+            scrolling.velocity += impulse;
+            scrolling.is_user_swiping = false;
+            scrolling.last_event = time.elapsed();
+        } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+            entity_commands.try_insert(Scrolling {
+                velocity: impulse,
+                position: f64::from(position.0.x),
+                is_user_swiping: false,
                 last_event: time.elapsed(),
             });
         }

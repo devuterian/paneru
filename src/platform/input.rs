@@ -536,7 +536,18 @@ impl InputHandler {
                         });
                     }
                 } else {
-                    _ = events.send(Event::Scroll { delta });
+                    // Trackpads report scroll/momentum phases and macOS adds its
+                    // own momentum; plain wheels report neither.
+                    let phase = CGEvent::integer_value_field(
+                        Some(event),
+                        CGEventField::ScrollWheelEventScrollPhase,
+                    );
+                    let momentum = CGEvent::integer_value_field(
+                        Some(event),
+                        CGEventField::ScrollWheelEventMomentumPhase,
+                    );
+                    let wheel = phase == 0 && momentum == 0;
+                    _ = events.send(Event::Scroll { delta, wheel });
                 }
                 return true; // Intercept: don't let the window scroll
             }
